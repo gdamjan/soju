@@ -15,7 +15,6 @@ import (
 	"time"
 	"unicode"
 
-	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/irc.v4"
 
 	"git.sr.ht/~emersion/soju/database"
@@ -1032,12 +1031,11 @@ func handleUserUpdate(ctx *serviceContext, params []string) error {
 
 		var hashed *string
 		if password != nil {
-			hashedBytes, err := bcrypt.GenerateFromPassword([]byte(*password), bcrypt.DefaultCost)
-			if err != nil {
-				return fmt.Errorf("failed to hash password: %v", err)
+			var passwordRecord database.User
+			if err := passwordRecord.SetPassword(*password); err != nil {
+				return err
 			}
-			hashedStr := string(hashedBytes)
-			hashed = &hashedStr
+			hashed = &passwordRecord.Password
 		}
 		if disablePassword {
 			hashedStr := ""
@@ -1068,23 +1066,6 @@ func handleUserUpdate(ctx *serviceContext, params []string) error {
 
 		ctx.print(fmt.Sprintf("updated user %q", username))
 	} else {
-		// copy the user record because we'll mutate it
-		record := ctx.user.User
-
-		if password != nil {
-			if err := record.SetPassword(*password); err != nil {
-				return err
-			}
-		}
-		if disablePassword {
-			record.Password = ""
-		}
-		if nick != nil {
-			record.Nick = *nick
-		}
-		if realname != nil {
-			record.Realname = *realname
-		}
 		if admin != nil {
 			return fmt.Errorf("cannot update -admin of own user")
 		}
@@ -1092,7 +1073,24 @@ func handleUserUpdate(ctx *serviceContext, params []string) error {
 			return fmt.Errorf("cannot update -enabled of own user")
 		}
 
-		if err := ctx.user.updateUser(ctx, &record); err != nil {
+		err := ctx.user.updateUser(ctx, func(record *database.User) error {
+			if password != nil {
+				if err := record.SetPassword(*password); err != nil {
+					return err
+				}
+			}
+			if disablePassword {
+				record.Password = ""
+			}
+			if nick != nil {
+				record.Nick = *nick
+			}
+			if realname != nil {
+				record.Realname = *realname
+			}
+			return nil
+		})
+		if err != nil {
 			return err
 		}
 
@@ -1224,7 +1222,7 @@ func handleServiceChannelStatus(ctx *serviceContext, params []string) error {
 
 	sendNetwork := func(net *network) {
 		var channels []*database.Channel
-		net.channels.ForEach(func(ch *database.Channel) {
+		net.channels.ForEach(func(_ string, ch *database.Channel) {
 			channels = append(channels, ch)
 		})
 

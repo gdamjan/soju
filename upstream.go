@@ -89,7 +89,7 @@ type upstreamChannel struct {
 	Status       xirc.ChannelStatus
 	modes        channelModes
 	creationTime string
-	Members      membershipsCasemapMap
+	Members      xirc.CaseMappingMap[*xirc.MembershipSet]
 	complete     bool
 	detachTimer  *time.Timer
 }
@@ -208,19 +208,17 @@ type upstreamConn struct {
 	realname    string
 	hostname    string
 	modes       userModes
-	channels    upstreamChannelCasemapMap
-	users       upstreamUserCasemapMap
+	channels    xirc.CaseMappingMap[*upstreamChannel]
+	users       xirc.CaseMappingMap[*upstreamUser]
 	caps        xirc.CapRegistry
 	batches     map[string]upstreamBatch
 	away        bool
 	account     string
 	nextLabelID uint64
-	monitored   monitorCasemapMap
+	monitored   xirc.CaseMappingMap[bool]
 
 	saslClient  sasl.Client
 	saslStarted bool
-
-	casemapIsSet bool
 
 	// Queue of commands in progress, indexed by type. The first entry has been
 	// sent to the server and is awaiting reply. The following entries have not
@@ -364,12 +362,13 @@ func connectToUpstream(ctx context.Context, network *network) (*upstreamConn, er
 		RateLimitBurst: upstreamMessageBurst,
 	}
 
+	cm := stdCaseMapping
 	uc := &upstreamConn{
 		conn:                  *newConn(network.user.srv, newNetIRCConn(netConn), &options),
 		network:               network,
 		user:                  network.user,
-		channels:              upstreamChannelCasemapMap{newCasemapMap()},
-		users:                 upstreamUserCasemapMap{newCasemapMap()},
+		channels:              xirc.NewCaseMappingMap[*upstreamChannel](cm),
+		users:                 xirc.NewCaseMappingMap[*upstreamUser](cm),
 		caps:                  xirc.NewCapRegistry(),
 		batches:               make(map[string]upstreamBatch),
 		serverPrefix:          &irc.Prefix{Name: "*"},
@@ -378,7 +377,7 @@ func connectToUpstream(ctx context.Context, network *network) (*upstreamConn, er
 		availableMemberships:  stdMemberships,
 		isupport:              make(map[string]*string),
 		pendingCmds:           make(map[string][]pendingUpstreamCommand),
-		monitored:             monitorCasemapMap{newCasemapMap()},
+		monitored:             xirc.NewCaseMappingMap[bool](cm),
 		hasDesiredNick:        true,
 	}
 	return uc, nil
@@ -900,7 +899,7 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 
 		if uc.network.channels.Len() > 0 {
 			var channels, keys []string
-			uc.network.channels.ForEach(func(ch *database.Channel) {
+			uc.network.channels.ForEach(func(_ string, ch *database.Channel) {
 				channels = append(channels, ch.Name)
 				keys = append(keys, ch.Key)
 			})
@@ -931,6 +930,7 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 				value = token[i+1:]
 				hasValue = true
 			}
+			parameter = strings.ToUpper(parameter)
 
 			if hasValue {
 				uc.isupport[parameter] = &value
@@ -943,12 +943,11 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 			var err error
 			switch parameter {
 			case "CASEMAPPING":
-				casemap, ok := parseCasemappingToken(value)
-				if !ok {
-					casemap = casemapRFC1459
+				casemap := xirc.ParseCaseMapping(value)
+				if casemap == nil {
+					casemap = xirc.CaseMappingRFC1459
 				}
 				uc.network.updateCasemapping(casemap)
-				uc.casemapIsSet = true
 			case "CHANMODES":
 				if !negate {
 					err = uc.handleChanModes(value)
@@ -980,26 +979,22 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 		uc.updateMonitor()
 
 		uc.forEachDownstream(func(dc *downstreamConn) {
-			if dc.network == nil {
-				return
-			}
 			msgs := xirc.GenerateIsupport(dc.srv.prefix(), dc.nick, downstreamIsupport)
 			for _, msg := range msgs {
 				dc.SendMessage(msg)
 			}
 		})
 	case irc.ERR_NOMOTD, irc.RPL_ENDOFMOTD:
-		if !uc.casemapIsSet {
-			// upstream did not send any CASEMAPPING token, thus
-			// we assume it implements the old RFCs with rfc1459.
-			uc.casemapIsSet = true
-			uc.network.updateCasemapping(casemapRFC1459)
-		}
-
 		if !uc.gotMotd {
 			// Ignore the initial MOTD upon connection, but forward
 			// subsequent MOTD messages downstream
 			uc.gotMotd = true
+
+			// If upstream did not send any CASEMAPPING token, assume it
+			// implements the old RFCs with rfc1459.
+			if uc.isupport["CASEMAPPING"] == nil {
+				uc.network.updateCasemapping(stdCaseMapping)
+			}
 
 			// If the server doesn't support MONITOR, periodically try to
 			// regain our desired nick
@@ -1073,7 +1068,7 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 			}
 		}
 
-		uc.channels.ForEach(func(ch *upstreamChannel) {
+		uc.channels.ForEach(func(_ string, ch *upstreamChannel) {
 			memberships := ch.Members.Get(msg.Prefix.Name)
 			if memberships != nil {
 				ch.Members.Del(msg.Prefix.Name)
@@ -1179,9 +1174,8 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 		for _, ch := range strings.Split(channels, ",") {
 			if uc.isOurNick(msg.Prefix.Name) {
 				uc.logger.Printf("joined channel %q", ch)
-				members := membershipsCasemapMap{newCasemapMap()}
-				members.casemap = uc.network.casemap
-				uc.channels.Set(&upstreamChannel{
+				members := xirc.NewCaseMappingMap[*xirc.MembershipSet](uc.network.casemap)
+				uc.channels.Set(ch, &upstreamChannel{
 					Name:    ch,
 					conn:    uc,
 					Members: members,
@@ -1270,7 +1264,7 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 			uc.logger.Printf("quit")
 		}
 
-		uc.channels.ForEach(func(ch *upstreamChannel) {
+		uc.channels.ForEach(func(_ string, ch *upstreamChannel) {
 			if ch.Members.Has(msg.Prefix.Name) {
 				ch.Members.Del(msg.Prefix.Name)
 				uc.appendLog(ch.Name, msg)
@@ -2265,10 +2259,10 @@ func (uc *upstreamConn) updateMonitor() {
 	var addList []string
 	seen := make(map[string]struct{})
 	uc.forEachDownstream(func(dc *downstreamConn) {
-		for _, entry := range dc.monitored.m {
-			targetCM := uc.network.casemap(entry.originalKey)
+		dc.monitored.ForEach(func(target string, _ struct{}) {
+			targetCM := uc.network.casemap(target)
 			if targetCM == serviceNickCM {
-				continue
+				return
 			}
 			if !uc.monitored.Has(targetCM) {
 				if _, ok := add[targetCM]; !ok {
@@ -2278,7 +2272,7 @@ func (uc *upstreamConn) updateMonitor() {
 			} else {
 				seen[targetCM] = struct{}{}
 			}
-		}
+		})
 	})
 
 	wantNick := database.GetNick(&uc.user.User, &uc.network.Network)
@@ -2446,12 +2440,12 @@ func (uc *upstreamConn) cacheUserInfo(nick string, info *upstreamUser) {
 		} else {
 			info.Nickname = nick
 		}
-		uc.users.Set(info)
+		uc.users.Set(info.Nickname, info)
 	} else {
 		uu.updateFrom(info)
 		if info.Nickname != "" && nick != info.Nickname {
 			uc.users.Del(nick)
-			uc.users.Set(uu)
+			uc.users.Set(uu.Nickname, uu)
 		}
 	}
 }
@@ -2465,7 +2459,7 @@ func (uc *upstreamConn) shouldCacheUserInfo(nick string) bool {
 		return true
 	}
 	found := false
-	uc.channels.ForEach(func(ch *upstreamChannel) {
+	uc.channels.ForEach(func(_ string, ch *upstreamChannel) {
 		found = found || ch.Members.Has(nick)
 	})
 	return found

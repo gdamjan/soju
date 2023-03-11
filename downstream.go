@@ -67,37 +67,13 @@ func newChatHistoryError(subcommand string, target string) ircError {
 	}}
 }
 
-// authError is an authentication error.
-type authError struct {
-	// Internal error cause. This will not be revealed to the user.
-	err error
-	// Error cause which can safely be sent to the user without compromising
-	// security.
-	reason string
-}
-
-func (err *authError) Error() string {
-	return err.err.Error()
-}
-
-func (err *authError) Unwrap() error {
-	return err.err
-}
-
 // authErrorReason returns the user-friendly reason of an authentication
 // failure.
 func authErrorReason(err error) string {
-	if authErr, ok := err.(*authError); ok {
-		return authErr.reason
+	if authErr, ok := err.(*auth.Error); ok {
+		return authErr.ExternalMsg
 	} else {
 		return "Authentication failed"
-	}
-}
-
-func newInvalidUsernameOrPasswordError(err error) error {
-	return &authError{
-		err:    err,
-		reason: "Invalid username or password",
 	}
 }
 
@@ -283,6 +259,7 @@ var needAllDownstreamCaps = map[string]string{
 var passthroughIsupport = map[string]bool{
 	"AWAYLEN":       true,
 	"BOT":           true,
+	"CASEMAPPING":   true,
 	"CHANLIMIT":     true,
 	"CHANMODES":     true,
 	"CHANNELLEN":    true,
@@ -371,13 +348,15 @@ type downstreamConn struct {
 
 	lastBatchRef uint64
 
-	monitored casemapMap
+	casemap   xirc.CaseMapping
+	monitored xirc.CaseMappingMap[struct{}]
 }
 
 func newDownstreamConn(srv *Server, ic ircConn, id uint64) *downstreamConn {
 	remoteAddr := ic.RemoteAddr().String()
 	logger := &prefixLogger{srv.Logger, fmt.Sprintf("downstream %q: ", remoteAddr)}
 	options := connOptions{Logger: logger}
+	cm := xirc.CaseMappingASCII
 	dc := &downstreamConn{
 		conn:         *newConn(srv, ic, &options),
 		id:           id,
@@ -385,10 +364,10 @@ func newDownstreamConn(srv *Server, ic ircConn, id uint64) *downstreamConn {
 		nickCM:       "*",
 		username:     "~u",
 		caps:         xirc.NewCapRegistry(),
-		monitored:    newCasemapMap(),
+		casemap:      cm,
+		monitored:    xirc.NewCaseMappingMap[struct{}](cm),
 		registration: new(downstreamRegistration),
 	}
-	dc.monitored.SetCasemapping(casemapASCII)
 	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
 		dc.hostname = host
 	} else {
@@ -401,7 +380,8 @@ func newDownstreamConn(srv *Server, ic ircConn, id uint64) *downstreamConn {
 	// TODO: this is racy, we should only enable chathistory after
 	// authentication and then check that user.msgStore implements
 	// chatHistoryMessageStore
-	if srv.Config().LogPath != "" {
+	switch srv.Config().LogDriver {
+	case "fs", "db":
 		dc.caps.Available["draft/chathistory"] = ""
 		dc.caps.Available["soju.im/search"] = ""
 	}
@@ -689,8 +669,7 @@ func (dc *downstreamConn) handleMessageUnregistered(ctx context.Context, msg *ir
 				break
 			}
 
-			if authErr := auth.AuthPlain(ctx, dc.srv.db, username, password); authErr != nil {
-				err = newInvalidUsernameOrPasswordError(authErr)
+			if err = auth.AuthPlain(ctx, dc.srv.db, username, password); err != nil {
 				break
 			}
 		case "OAUTHBEARER":
@@ -700,15 +679,14 @@ func (dc *downstreamConn) handleMessageUnregistered(ctx context.Context, msg *ir
 				break
 			}
 
-			var authErr error
-			username, authErr = auth.AuthOAuthBearer(ctx, dc.srv.db, credentials.oauthBearer.Token)
-			if authErr != nil {
-				err = newInvalidUsernameOrPasswordError(authErr)
+			username, err = auth.AuthOAuthBearer(ctx, dc.srv.db, credentials.oauthBearer.Token)
+			if err != nil {
 				break
 			}
 
 			if credentials.oauthBearer.Username != "" && credentials.oauthBearer.Username != username {
-				err = newInvalidUsernameOrPasswordError(fmt.Errorf("username mismatch (server returned %q)", username))
+				err = fmt.Errorf("username mismatch (server returned %q)", username)
+				break
 			}
 		default:
 			panic(fmt.Errorf("unexpected SASL mechanism %q", credentials.mechanism))
@@ -1134,7 +1112,7 @@ func (dc *downstreamConn) updateNick() {
 		Params:  []string{nick},
 	})
 	dc.nick = nick
-	dc.nickCM = casemapASCII(dc.nick)
+	dc.nickCM = dc.casemap(dc.nick)
 }
 
 func (dc *downstreamConn) updateHost() {
@@ -1220,6 +1198,17 @@ func (dc *downstreamConn) updateAccount() {
 	dc.account = account
 }
 
+func (dc *downstreamConn) updateCasemapping() {
+	cm := xirc.CaseMappingASCII
+	if dc.network != nil {
+		cm = dc.network.casemap
+	}
+
+	dc.casemap = cm
+	dc.nickCM = cm(dc.nick)
+	dc.monitored.SetCaseMapping(cm)
+}
+
 func sanityCheckServer(ctx context.Context, addr string) error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -1291,7 +1280,7 @@ func (dc *downstreamConn) authenticate(ctx context.Context, username, password s
 	}
 
 	if err := plainAuth.AuthPlain(ctx, dc.srv.db, username, password); err != nil {
-		return newInvalidUsernameOrPasswordError(err)
+		return err
 	}
 
 	return dc.setUser(username, clientName, networkName)
@@ -1411,7 +1400,7 @@ func (dc *downstreamConn) loadNetwork(ctx context.Context) error {
 				Params:  []string{dc.nick, dc.registration.nick, "Nickname contains illegal characters"},
 			}}
 		}
-		if casemapASCII(nick) == serviceNickCM {
+		if xirc.CaseMappingASCII(nick) == serviceNickCM {
 			return ircError{&irc.Message{
 				Command: irc.ERR_NICKNAMEINUSE,
 				Params:  []string{dc.nick, dc.registration.nick, "Nickname reserved for bouncer service"},
@@ -1460,16 +1449,13 @@ func (dc *downstreamConn) welcome(ctx context.Context) error {
 	} else {
 		dc.nick = dc.user.Username
 	}
-	dc.nickCM = casemapASCII(dc.nick)
+	dc.nickCM = dc.casemap(dc.nick)
 
-	isupport := []string{
-		"CASEMAPPING=ascii",
-	}
-
+	var isupport []string
 	if dc.network != nil {
 		isupport = append(isupport, fmt.Sprintf("BOUNCER_NETID=%v", dc.network.ID))
 	} else {
-		isupport = append(isupport, "BOT=B")
+		isupport = append(isupport, "BOT=B", "CASEMAPPING=ascii")
 	}
 	if title := dc.srv.Config().Title; dc.network == nil && title != "" {
 		isupport = append(isupport, "NETWORK="+title)
@@ -1480,6 +1466,7 @@ func (dc *downstreamConn) welcome(ctx context.Context) error {
 	}
 	if _, ok := dc.user.msgStore.(msgstore.ChatHistoryStore); ok && dc.network != nil {
 		isupport = append(isupport, fmt.Sprintf("CHATHISTORY=%v", chatHistoryLimit))
+		isupport = append(isupport, "MSGREFTYPES=timestamp")
 	}
 	if dc.caps.IsEnabled("soju.im/webpush") {
 		isupport = append(isupport, "VAPID="+dc.srv.webPush.VAPIDKeys.Public)
@@ -1535,6 +1522,7 @@ func (dc *downstreamConn) welcome(ctx context.Context) error {
 	dc.updateHost()
 	dc.updateRealname()
 	dc.updateAccount()
+	dc.updateCasemapping()
 
 	if motd := dc.user.srv.Config().MOTD; motd != "" && dc.network == nil {
 		for _, msg := range xirc.GenerateMOTD(dc.srv.prefix(), dc.nick, motd) {
@@ -1568,7 +1556,7 @@ func (dc *downstreamConn) welcome(ctx context.Context) error {
 	}
 
 	dc.forEachUpstream(func(uc *upstreamConn) {
-		uc.channels.ForEach(func(ch *upstreamChannel) {
+		uc.channels.ForEach(func(_ string, ch *upstreamChannel) {
 			if !ch.complete {
 				return
 			}
@@ -1776,7 +1764,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 				Params:  []string{dc.nick, nick, "Nickname contains illegal characters"},
 			}}
 		}
-		if casemapASCII(nick) == serviceNickCM {
+		if dc.casemap(nick) == serviceNickCM {
 			return ircError{&irc.Message{
 				Command: irc.ERR_NICKNAMEINUSE,
 				Params:  []string{dc.nick, nick, "Nickname reserved for bouncer service"},
@@ -1789,9 +1777,10 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			record.Nick = nick
 			err = dc.srv.db.StoreNetwork(ctx, dc.user.ID, &record)
 		} else {
-			record := dc.user.User
-			record.Nick = nick
-			err = dc.user.updateUser(ctx, &record)
+			err = dc.user.updateUser(ctx, func(record *database.User) error {
+				record.Nick = nick
+				return nil
+			})
 		}
 		if err != nil {
 			dc.logger.Printf("failed to update nick: %v", err)
@@ -1856,9 +1845,10 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 				_, err = dc.user.updateNetwork(ctx, &record)
 			}
 		} else {
-			record := dc.user.User
-			record.Realname = realname
-			err = dc.user.updateUser(ctx, &record)
+			err = dc.user.updateUser(ctx, func(record *database.User) error {
+				record.Realname = realname
+				return nil
+			})
 		}
 
 		if err != nil {
@@ -1943,7 +1933,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 					Name: name,
 					Key:  key,
 				}
-				uc.network.channels.Set(ch)
+				uc.network.channels.Set(ch.Name, ch)
 			}
 			if err := dc.srv.db.StoreChannel(ctx, uc.network.ID, ch); err != nil {
 				dc.logger.Printf("failed to create or update channel %q: %v", name, err)
@@ -1975,7 +1965,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 						Name:     name,
 						Detached: true,
 					}
-					uc.network.channels.Set(ch)
+					uc.network.channels.Set(ch.Name, ch)
 				}
 				if err := dc.srv.db.StoreChannel(ctx, uc.network.ID, ch); err != nil {
 					dc.logger.Printf("failed to create or update channel %q: %v", name, err)
@@ -2015,7 +2005,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			modeStr = msg.Params[1]
 		}
 
-		if casemapASCII(name) == dc.nickCM {
+		if dc.casemap(name) == dc.nickCM {
 			if modeStr != "" {
 				if uc := dc.upstream(); uc != nil {
 					uc.SendMessageLabeled(ctx, dc.id, &irc.Message{
@@ -2180,7 +2170,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 		fields, whoxToken := xirc.ParseWHOXOptions(options)
 
 		// TODO: support mixed bouncer/upstream WHO queries
-		maskCM := casemapASCII(mask)
+		maskCM := dc.casemap(mask)
 		if dc.network == nil && maskCM == dc.nickCM {
 			// TODO: support AWAY (H/G) in self WHO reply
 			flags := "H"
@@ -2289,7 +2279,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			mask = mask[:i]
 		}
 
-		if dc.network == nil && casemapASCII(mask) == dc.nickCM {
+		if dc.network == nil && dc.casemap(mask) == dc.nickCM {
 			dc.SendMessage(&irc.Message{
 				Prefix:  dc.srv.prefix(),
 				Command: irc.RPL_WHOISUSER,
@@ -2319,7 +2309,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			})
 			return nil
 		}
-		if casemapASCII(mask) == serviceNickCM {
+		if dc.casemap(mask) == serviceNickCM {
 			dc.SendMessage(&irc.Message{
 				Prefix:  dc.srv.prefix(),
 				Command: irc.RPL_WHOISUSER,
@@ -2406,7 +2396,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 				continue
 			}
 
-			if dc.network == nil && casemapASCII(name) == dc.nickCM {
+			if dc.network == nil && dc.casemap(name) == dc.nickCM {
 				dc.SendMessage(&irc.Message{
 					Tags:    msg.Tags.Copy(),
 					Prefix:  dc.prefix(),
@@ -2416,7 +2406,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 				continue
 			}
 
-			if casemapASCII(name) == serviceNickCM {
+			if dc.casemap(name) == serviceNickCM {
 				if dc.caps.IsEnabled("echo-message") {
 					echoTags := tags.Copy()
 					echoTags["time"] = dc.user.FormatServerTime(time.Now())
@@ -2636,7 +2626,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 						continue
 					}
 
-					dc.monitored.set(target, nil)
+					dc.monitored.Set(target, struct{}{})
 
 					if uc.network.casemap(target) == serviceNickCM {
 						// BouncerServ is never tired
@@ -2666,18 +2656,17 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			}
 			uc.updateMonitor()
 		case "C": // clear
-			dc.monitored = newCasemapMap()
-			dc.monitored.SetCasemapping(casemapASCII)
+			dc.monitored = xirc.NewCaseMappingMap[struct{}](uc.network.casemap)
 			uc.updateMonitor()
 		case "L": // list
 			// TODO: be less lazy and pack the list
-			for _, entry := range dc.monitored.m {
+			dc.monitored.ForEach(func(name string, _ struct{}) {
 				dc.SendMessage(&irc.Message{
 					Prefix:  dc.srv.prefix(),
 					Command: irc.RPL_MONLIST,
-					Params:  []string{dc.nick, entry.originalKey},
+					Params:  []string{dc.nick, name},
 				})
-			}
+			})
 			dc.SendMessage(&irc.Message{
 				Prefix:  dc.srv.prefix(),
 				Command: irc.RPL_ENDOFMONLIST,
@@ -2685,9 +2674,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			})
 		case "S": // status
 			// TODO: be less lazy and pack the lists
-			for _, entry := range dc.monitored.m {
-				target := entry.originalKey
-
+			dc.monitored.ForEach(func(target string, _ struct{}) {
 				cmd := irc.RPL_MONOFFLINE
 				if online := uc.monitored.Get(target); online {
 					cmd = irc.RPL_MONONLINE
@@ -2702,7 +2689,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 					Command: cmd,
 					Params:  []string{dc.nick, target},
 				})
-			}
+			})
 		}
 	case "CHATHISTORY":
 		var subcommand string
@@ -2739,7 +2726,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 		}
 
 		// We don't save history for our service
-		if casemapASCII(target) == serviceNickCM {
+		if dc.casemap(target) == serviceNickCM {
 			dc.SendBatch("chathistory", []string{target}, nil, func(batchRef string) {})
 			return nil
 		}
@@ -2864,7 +2851,7 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 		}
 
 		// We don't save read receipts for our service
-		if casemapASCII(target) == serviceNickCM {
+		if dc.casemap(target) == serviceNickCM {
 			dc.SendMessage(&irc.Message{
 				Prefix:  dc.prefix(),
 				Command: msg.Command,
@@ -3228,10 +3215,13 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 				}}
 			}
 
+			updateSub := true
 			oldSub := findWebPushSubscription(subs, endpoint)
 			if oldSub != nil {
 				// Update the old subscription instead of creating a new one
 				newSub.ID = oldSub.ID
+				// Rate-limit subscription checks
+				updateSub = time.Since(oldSub.UpdatedAt) > webpushCheckSubscriptionDelay || oldSub.Keys != newSub.Keys
 			}
 
 			var networkID int64
@@ -3240,32 +3230,34 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			}
 
 			// Send a test Web Push message, to make sure the endpoint is valid
-			err = dc.srv.sendWebPush(ctx, &webpush.Subscription{
-				Endpoint: newSub.Endpoint,
-				Keys: webpush.Keys{
-					Auth:   newSub.Keys.Auth,
-					P256dh: newSub.Keys.P256DH,
-				},
-			}, newSub.Keys.VAPID, &irc.Message{
-				Command: "NOTE",
-				Params:  []string{"WEBPUSH", "REGISTERED", "Push notifications enabled"},
-			})
-			if err != nil {
-				dc.logger.Printf("failed to send Web push notification to endpoint %q: %v", newSub.Endpoint, err)
-				return ircError{&irc.Message{
-					Command: "FAIL",
-					Params:  []string{"WEBPUSH", "INVALID_PARAMS", subcommand, "Invalid endpoint"},
-				}}
-			}
+			if updateSub {
+				err = dc.srv.sendWebPush(ctx, &webpush.Subscription{
+					Endpoint: newSub.Endpoint,
+					Keys: webpush.Keys{
+						Auth:   newSub.Keys.Auth,
+						P256dh: newSub.Keys.P256DH,
+					},
+				}, newSub.Keys.VAPID, &irc.Message{
+					Command: "NOTE",
+					Params:  []string{"WEBPUSH", "REGISTERED", "Push notifications enabled"},
+				})
+				if err != nil {
+					dc.logger.Printf("failed to send Web push notification to endpoint %q: %v", newSub.Endpoint, err)
+					return ircError{&irc.Message{
+						Command: "FAIL",
+						Params:  []string{"WEBPUSH", "INVALID_PARAMS", subcommand, "Invalid endpoint"},
+					}}
+				}
 
-			// TODO: limit max number of subscriptions, prune old ones
+				// TODO: limit max number of subscriptions, prune old ones
 
-			if err := dc.user.srv.db.StoreWebPushSubscription(ctx, dc.user.ID, networkID, &newSub); err != nil {
-				dc.logger.Printf("failed to store Web push subscription: %v", err)
-				return ircError{&irc.Message{
-					Command: "FAIL",
-					Params:  []string{"WEBPUSH", "INTERNAL_ERROR", subcommand, "Internal error"},
-				}}
+				if err := dc.user.srv.db.StoreWebPushSubscription(ctx, dc.user.ID, networkID, &newSub); err != nil {
+					dc.logger.Printf("failed to store Web push subscription: %v", err)
+					return ircError{&irc.Message{
+						Command: "FAIL",
+						Params:  []string{"WEBPUSH", "INTERNAL_ERROR", subcommand, "Internal error"},
+					}}
+				}
 			}
 
 			dc.SendMessage(&irc.Message{

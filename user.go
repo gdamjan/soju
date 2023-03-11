@@ -23,6 +23,8 @@ import (
 	"git.sr.ht/~emersion/soju/msgstore"
 )
 
+type UserUpdateFunc func(record *database.User) error
+
 type event interface{}
 
 type eventUpstreamMessage struct {
@@ -93,11 +95,11 @@ type eventUserRun struct {
 type deliveredClientMap map[string]string // client name -> msg ID
 
 type deliveredStore struct {
-	m deliveredCasemapMap
+	m xirc.CaseMappingMap[deliveredClientMap]
 }
 
-func newDeliveredStore() deliveredStore {
-	return deliveredStore{deliveredCasemapMap{newCasemapMap()}}
+func newDeliveredStore(cm xirc.CaseMapping) deliveredStore {
+	return deliveredStore{xirc.NewCaseMappingMap[deliveredClientMap](cm)}
 }
 
 func (ds deliveredStore) HasTarget(target string) bool {
@@ -147,20 +149,24 @@ type network struct {
 	stopped chan struct{}
 
 	conn        *upstreamConn
-	channels    channelCasemapMap
+	channels    xirc.CaseMappingMap[*database.Channel]
 	delivered   deliveredStore
-	pushTargets pushTargetCasemapMap
+	pushTargets xirc.CaseMappingMap[time.Time]
 	lastError   error
-	casemap     casemapping
+	casemap     xirc.CaseMapping
 }
 
 func newNetwork(user *user, record *database.Network, channels []database.Channel) *network {
 	logger := &prefixLogger{user.logger, fmt.Sprintf("network %q: ", record.GetName())}
 
-	m := channelCasemapMap{newCasemapMap()}
+	// Initialize maps with the most strict case-mapping to avoid collisions:
+	// we don't know which case-mapping will be used by the upstream server yet
+	cm := xirc.CaseMappingASCII
+
+	m := xirc.NewCaseMappingMap[*database.Channel](cm)
 	for _, ch := range channels {
 		ch := ch
-		m.Set(&ch)
+		m.Set(ch.Name, &ch)
 	}
 
 	return &network{
@@ -169,9 +175,9 @@ func newNetwork(user *user, record *database.Network, channels []database.Channe
 		logger:      logger,
 		stopped:     make(chan struct{}),
 		channels:    m,
-		delivered:   newDeliveredStore(),
-		pushTargets: pushTargetCasemapMap{newCasemapMap()},
-		casemap:     casemapRFC1459,
+		delivered:   newDeliveredStore(cm),
+		pushTargets: xirc.NewCaseMappingMap[time.Time](cm),
+		casemap:     stdCaseMapping,
 	}
 }
 
@@ -387,21 +393,21 @@ func (net *network) deleteChannel(ctx context.Context, name string) error {
 	return nil
 }
 
-func (net *network) updateCasemapping(newCasemap casemapping) {
+func (net *network) updateCasemapping(newCasemap xirc.CaseMapping) {
 	net.casemap = newCasemap
-	net.channels.SetCasemapping(newCasemap)
-	net.delivered.m.SetCasemapping(newCasemap)
-	net.pushTargets.SetCasemapping(newCasemap)
+	net.channels.SetCaseMapping(newCasemap)
+	net.delivered.m.SetCaseMapping(newCasemap)
+	net.pushTargets.SetCaseMapping(newCasemap)
 	if uc := net.conn; uc != nil {
-		uc.channels.SetCasemapping(newCasemap)
-		uc.channels.ForEach(func(uch *upstreamChannel) {
-			uch.Members.SetCasemapping(newCasemap)
+		uc.channels.SetCaseMapping(newCasemap)
+		uc.channels.ForEach(func(_ string, uch *upstreamChannel) {
+			uch.Members.SetCaseMapping(newCasemap)
 		})
-		uc.users.SetCasemapping(newCasemap)
-		uc.monitored.SetCasemapping(newCasemap)
+		uc.users.SetCaseMapping(newCasemap)
+		uc.monitored.SetCaseMapping(newCasemap)
 	}
 	net.forEachDownstream(func(dc *downstreamConn) {
-		dc.monitored.SetCasemapping(newCasemap)
+		dc.updateCasemapping()
 	})
 }
 
@@ -486,13 +492,13 @@ func (net *network) broadcastWebPush(msg *irc.Message) {
 				P256dh: sub.Keys.P256DH,
 			},
 		}, sub.Keys.VAPID, msg)
-		if err != nil {
-			net.logger.Printf("failed to send Web push notification to endpoint %q: %v", sub.Endpoint, err)
-		}
 		if err == errWebPushSubscriptionExpired {
 			if err := net.user.srv.db.DeleteWebPushSubscription(ctx, sub.ID); err != nil {
 				net.logger.Printf("failed to delete expired Web Push subscription: %v", err)
 			}
+			net.logger.Debugf("deleted expired Web Push subscription %q", sub.Endpoint)
+		} else if err != nil {
+			net.logger.Printf("failed to send Web push notification to endpoint %q: %v", sub.Endpoint, err)
 		}
 	}
 }
@@ -516,9 +522,12 @@ func newUser(srv *Server, record *database.User) *user {
 	logger := &prefixLogger{srv.Logger, fmt.Sprintf("user %q: ", record.Username)}
 
 	var msgStore msgstore.Store
-	if logPath := srv.Config().LogPath; logPath != "" {
-		msgStore = msgstore.NewFSStore(logPath, record)
-	} else {
+	switch srv.Config().LogDriver {
+	case "fs":
+		msgStore = msgstore.NewFSStore(srv.Config().LogPath, record)
+	case "db":
+		msgStore = msgstore.NewDBStore(srv.db)
+	case "memory":
 		msgStore = msgstore.NewMemoryStore()
 	}
 
@@ -629,6 +638,7 @@ func (u *user) run() {
 				dc.updateHost()
 				dc.updateRealname()
 				dc.updateAccount()
+				dc.updateCasemapping()
 			})
 			u.notifyBouncerNetworkState(uc.network.ID, irc.Tags{
 				"state": "connected",
@@ -690,13 +700,15 @@ func (u *user) run() {
 			ctx := context.TODO()
 
 			if dc.network != nil {
-				dc.monitored.SetCasemapping(dc.network.casemap)
+				dc.monitored.SetCaseMapping(dc.network.casemap)
 			}
 
 			if !u.Enabled && u.srv.Config().EnableUsersOnAuth {
-				record := u.User
-				record.Enabled = true
-				if err := u.updateUser(ctx, &record); err != nil {
+				err := u.updateUser(ctx, func(record *database.User) error {
+					record.Enabled = true
+					return nil
+				})
+				if err != nil {
 					dc.logger.Printf("failed to enable user after successful authentication: %v", err)
 				}
 			}
@@ -783,20 +795,18 @@ func (u *user) run() {
 				dc.SendMessage(msg)
 			}
 		case eventUserUpdate:
-			// copy the user record because we'll mutate it
-			record := u.User
-
-			if e.password != nil {
-				record.Password = *e.password
-			}
-			if e.admin != nil {
-				record.Admin = *e.admin
-			}
-			if e.enabled != nil {
-				record.Enabled = *e.enabled
-			}
-
-			e.done <- u.updateUser(context.TODO(), &record)
+			e.done <- u.updateUser(context.TODO(), func(record *database.User) error {
+				if e.password != nil {
+					record.Password = *e.password
+				}
+				if e.admin != nil {
+					record.Admin = *e.admin
+				}
+				if e.enabled != nil {
+					record.Enabled = *e.enabled
+				}
+				return nil
+			})
 
 			// If the password was updated, kill all downstream connections to
 			// force them to re-authenticate with the new credentials.
@@ -852,7 +862,7 @@ func (u *user) handleUpstreamDisconnected(uc *upstreamConn) {
 	uc.stopRegainNickTimer()
 	uc.abortPendingCommands()
 
-	uc.channels.ForEach(func(uch *upstreamChannel) {
+	uc.channels.ForEach(func(_ string, uch *upstreamChannel) {
 		uch.updateAutoDetach(0)
 	})
 
@@ -1032,7 +1042,7 @@ func (u *user) updateNetwork(ctx context.Context, record *database.Network) (*ne
 	// Most network changes require us to re-connect to the upstream server
 
 	channels := make([]database.Channel, 0, network.channels.Len())
-	network.channels.ForEach(func(ch *database.Channel) {
+	network.channels.ForEach(func(_ string, ch *database.Channel) {
 		channels = append(channels, *ch)
 	})
 
@@ -1102,18 +1112,19 @@ func (u *user) deleteNetwork(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (u *user) updateUser(ctx context.Context, record *database.User) error {
-	if u.ID != record.ID {
-		panic("ID mismatch when updating user")
+func (u *user) updateUser(ctx context.Context, update UserUpdateFunc) error {
+	record := u.User // copy
+	if err := update(&record); err != nil {
+		return err
 	}
 
 	nickUpdated := u.Nick != record.Nick
 	realnameUpdated := u.Realname != record.Realname
 	enabledUpdated := u.Enabled != record.Enabled
-	if err := u.srv.db.StoreUser(ctx, record); err != nil {
+	if err := u.srv.db.StoreUser(ctx, &record); err != nil {
 		return fmt.Errorf("failed to update user %q: %v", u.Username, err)
 	}
-	u.User = *record
+	u.User = record
 
 	if nickUpdated {
 		for _, net := range u.networks {
@@ -1256,9 +1267,11 @@ func (u *user) localTCPAddrForHost(ctx context.Context, host string) (*net.TCPAd
 }
 
 func (u *user) bumpDownstreamInteractionTime(ctx context.Context) {
-	record := u.User
-	record.DownstreamInteractedAt = time.Now()
-	if err := u.updateUser(ctx, &record); err != nil {
+	err := u.updateUser(ctx, func(record *database.User) error {
+		record.DownstreamInteractedAt = time.Now()
+		return nil
+	})
+	if err != nil {
 		u.logger.Printf("failed to bump downstream interaction time: %v", err)
 	}
 }
