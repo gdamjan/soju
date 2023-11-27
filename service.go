@@ -20,6 +20,10 @@ import (
 	"git.sr.ht/~emersion/soju/database"
 )
 
+var (
+	version = "dev"
+)
+
 const serviceNick = "BouncerServ"
 const serviceNickCM = "bouncerserv"
 const serviceRealname = "soju bouncer service"
@@ -215,6 +219,13 @@ func init() {
 			handle: handleServiceHelp,
 			global: true,
 		},
+		"version": {
+			usage:  "<version>",
+			desc:   "print soju version",
+			handle: handleServiceVersion,
+			admin: true,
+			global: true,
+		},
 		"network": {
 			children: serviceCommandSet{
 				"create": {
@@ -398,6 +409,11 @@ func handleServiceHelp(ctx *serviceContext, params []string) error {
 		appendServiceCommandSetHelp(serviceCommands, nil, ctx.admin, ctx.user == nil, &l)
 		ctx.print("available commands: " + strings.Join(l, ", "))
 	}
+	return nil
+}
+
+func handleServiceVersion(ctx *serviceContext, params []string) error {
+	ctx.print("Soju version: " + version)
 	return nil
 }
 
