@@ -1,0 +1,27 @@
+name: Make release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - run: make soju GOFLAGS="-tags=libsqlite3" # -ldflags="-s -w"
+
+      - name: Make a release
+        uses: softprops/action-gh-release@v1
+        with:
+          prerelease: true
+          files: |
+            soju
+            sojudb
+            sojuctl
