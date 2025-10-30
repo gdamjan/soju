@@ -2,9 +2,15 @@ name: Make release
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
+    inputs:
+      ref:
+        description: 'Git Reference'
+        required: true
+        default: 'master'
+      tag:
+        description: 'Tag to create'
+        required: true
+
 
 jobs:
   release:
@@ -12,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: master
+          ref: ${{ inputs.ref }}
       - uses: actions/setup-go@v6
         with:
           go-version: 'stable'
@@ -22,6 +28,8 @@ jobs:
       - name: Make a release
         uses: softprops/action-gh-release@v2
         with:
+          target_commitish: ${{ inputs.ref }}
+          tag_name: ${{ inputs.tag }}
           prerelease: true
           files: |
             soju
